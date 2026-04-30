@@ -15,18 +15,31 @@ logger = logging.getLogger("launcher")
 
 
 async def run_bot() -> None:
-    application = build_application()
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    logger.info("Telegram bot started in polling mode.")
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    while True:
+        application = None
+        try:
+            application = build_application()
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                timeout=30,
+            )
+            logger.info("Telegram bot started in polling mode.")
+            while True:
+                await asyncio.sleep(3600)
+        except Exception as exc:
+            logger.exception("Bot crashed: %s. Restarting in 15s...", exc)
+            try:
+                if application is not None:
+                    if application.updater and application.updater.running:
+                        await application.updater.stop()
+                    if application.running:
+                        await application.stop()
+                    await application.shutdown()
+            except Exception:
+                pass
+            await asyncio.sleep(15)
 
 
 async def run_web() -> None:
