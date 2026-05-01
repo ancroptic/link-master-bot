@@ -1,4 +1,4 @@
-"""Server-side LKSFY bypass using curl_cffi (Chrome TLS fingerprint)."""
+"""Server-side LKSFY/intermediate-host bypass using curl_cffi (Chrome TLS fingerprint)."""
 from __future__ import annotations
 import asyncio
 import logging
@@ -10,6 +10,9 @@ logger = logging.getLogger(__name__)
 
 LKSFY_HOSTS = {"lksfy.com", "www.lksfy.com"}
 INTERMEDIATE_HOSTS = {"sharclub.in", "sportswordz.com", "wblaxmibhandar.com"}
+SHORTENER_HOSTS = LKSFY_HOSTS | INTERMEDIATE_HOSTS | {
+    "gplinks.com", "www.gplinks.com", "linkshortify.com", "www.linkshortify.com",
+}
 
 _HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -21,16 +24,36 @@ _HEADERS = {
     "Sec-Fetch-User": "?1",
 }
 
-_LOC_PATTERN = '(?:window\\.location(?:\\.href)?|location\\.replace|location\\.href)\\s*[=(]\\s*[\'"]([^\'"]+)[\'"]'
-_URL_PATTERN = 'https?://[^\\s\'"<>)]+'
+_LOC_PATTERN = r'(?:window\.location(?:\.href)?|location\.replace|location\.href)\s*[=(]\s*[\'"]([^\'"]+)[\'"]'
+_META_REFRESH = r'<meta[^>]+http-equiv=[\'"]?refresh[\'"]?[^>]+url=([^\'";> ]+)'
+_URL_PATTERN = r'https?://[^\s\'"<>)]+'
 _LOCATION_RE = re.compile(_LOC_PATTERN, re.IGNORECASE)
+_META_RE = re.compile(_META_REFRESH, re.IGNORECASE)
 _ANY_URL_RE = re.compile(_URL_PATTERN)
 
 _NOISE_HOST_FRAGMENTS = (
     "cloudflare", "cloudflareinsights", "jsdelivr", "googletagmanager",
     "google-analytics", "gstatic", "googleapis", "fonts.google",
-    "facebook", "doubleclick", "adservice", "cdn-cgi",
+    "facebook", "doubleclick", "adservice", "cdn-cgi", "challenges.cloudflare",
+    "schema.org", "w3.org",
 )
+
+_IMPERSONATES = ("chrome124", "chrome120", "chrome110", "safari17_0")
+
+
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()
+
+
+def _is_lksfy(host: str) -> bool:
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in LKSFY_HOSTS)
+
+
+def _is_shortener(host: str) -> bool:
+    host = (host or "").lower()
+    return any(host == h or host.endswith("." + h) for h in SHORTENER_HOSTS)
+
 
 def _normalize_to_lksfy(short_url: str) -> str:
     parsed = urlparse(short_url)
@@ -42,64 +65,85 @@ def _normalize_to_lksfy(short_url: str) -> str:
             return f"https://lksfy.com/{ids[0]}"
     return short_url
 
-def _is_lksfy(host: str) -> bool:
-    host = (host or "").lower()
-    return any(host == h or host.endswith("." + h) for h in LKSFY_HOSTS)
 
-def _extract_destination(html: str) -> Optional[str]:
-    m = _LOCATION_RE.search(html)
-    if m:
-        cand = m.group(1)
-        h = (urlparse(cand).hostname or "").lower()
-        if h and not _is_lksfy(h):
-            return cand
-    for m2 in _ANY_URL_RE.finditer(html):
-        cand = m2.group(0).rstrip('";,)')
-        h = (urlparse(cand).hostname or "").lower()
-        if not h or _is_lksfy(h):
+def _extract_destination(html: str, current_host: str) -> Optional[str]:
+    for rx in (_LOCATION_RE, _META_RE):
+        for m in rx.finditer(html or ""):
+            cand = m.group(1).strip()
+            h = _host(cand)
+            if h and h != current_host and not _is_shortener(h) and not any(seg in h for seg in _NOISE_HOST_FRAGMENTS):
+                return cand
+    for m2 in _ANY_URL_RE.finditer(html or ""):
+        cand = m2.group(0).rstrip('";,)\'')
+        h = _host(cand)
+        if not h or h == current_host or _is_shortener(h):
             continue
         if any(seg in h for seg in _NOISE_HOST_FRAGMENTS):
             continue
         return cand
     return None
 
-def _sync_bypass_lksfy(target: str) -> Optional[str]:
+
+def _sync_fetch(target: str):
     try:
         from curl_cffi import requests as cffi_requests
     except Exception as e:
         logger.warning("curl_cffi unavailable: %s", e)
-        return None
-    try:
-        with cffi_requests.Session() as s:
-            r = s.get(
-                target,
-                headers=_HEADERS,
-                cookies={"ab": "1"},
-                impersonate="chrome124",
-                allow_redirects=True,
-                timeout=20,
-            )
-            final = str(r.url)
-            fh = (urlparse(final).hostname or "").lower()
-            if fh and not _is_lksfy(fh):
-                return final
-            return _extract_destination(r.text or "")
-    except Exception as e:
-        logger.warning("curl_cffi lksfy bypass failed for %s: %s", target, e)
-        return None
+        return None, None, None
+    last_exc = None
+    for prof in _IMPERSONATES:
+        try:
+            with cffi_requests.Session() as s:
+                r = s.get(
+                    target,
+                    headers=_HEADERS,
+                    cookies={"ab": "1"},
+                    impersonate=prof,
+                    allow_redirects=True,
+                    timeout=25,
+                )
+                return str(r.url), r.status_code, (r.text or "")
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc:
+        logger.warning("curl_cffi all profiles failed for %s: %s", target, last_exc)
+    return None, None, None
+
+
+def _sync_resolve(short_url: str, max_hops: int = 5) -> Optional[str]:
+    current = _normalize_to_lksfy(short_url)
+    seen = set()
+    for _ in range(max_hops):
+        if not current or current in seen:
+            break
+        seen.add(current)
+        final_url, status, body = _sync_fetch(current)
+        if not final_url:
+            return None
+        fh = _host(final_url)
+        if fh and not _is_shortener(fh):
+            return final_url
+        nxt = _extract_destination(body, fh)
+        if not nxt:
+            return None
+        if not _is_shortener(_host(nxt)):
+            return nxt
+        current = _normalize_to_lksfy(nxt)
+    return None
+
 
 async def bypass_lksfy(short_url: str) -> Optional[str]:
-    target = _normalize_to_lksfy(short_url)
-    return await asyncio.to_thread(_sync_bypass_lksfy, target)
+    return await asyncio.to_thread(_sync_resolve, short_url)
 
-async def bypass_provider(short_url: str) -> str:
-    """Returns destination URL on success, else original short_url (fallback)."""
-    host = (urlparse(short_url).hostname or "").lower()
-    if any(host == h or host.endswith("." + h) for h in LKSFY_HOSTS | INTERMEDIATE_HOSTS):
+
+async def bypass_provider(short_url: str) -> Optional[str]:
+    """Returns destination URL on success, None on failure (caller handles fallback)."""
+    host = _host(short_url)
+    if _is_shortener(host):
         try:
-            result = await bypass_lksfy(short_url)
+            return await bypass_lksfy(short_url)
         except Exception as e:
             logger.exception("bypass_provider error: %s", e)
-            result = None
-        return result or short_url
+            return None
     return short_url

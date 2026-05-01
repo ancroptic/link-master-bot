@@ -30,13 +30,14 @@ async def redirect_engine(bridge_code: str, request: Request) -> RedirectRespons
     link_data = await db.get_link_by_code(bridge_code)
     if not link_data:
         raise HTTPException(status_code=404, detail="Link not found")
+    original_url = link_data["original_url"]
 
     settings = await db.get_settings()
     if settings.get("maintenance_mode"):
         raise HTTPException(status_code=503, detail="Maintenance")
 
     if not settings.get("global_redirect_enabled", True):
-        return RedirectResponse(url=link_data["original_url"])
+        return RedirectResponse(url=original_url)
 
     visit = await db.get_or_create_click(link_data["id"], visitor_ip)
     if visit["click_count"] == 1:
@@ -44,10 +45,14 @@ async def redirect_engine(bridge_code: str, request: Request) -> RedirectRespons
     else:
         api = await db.get_admin_api()
 
-    short_url = await shorten_link(link_data["original_url"], api)
+    short_url = await shorten_link(original_url, api)
 
     if settings.get("bypass_enabled", True):
-        final = await bypass_provider(short_url)
-        return RedirectResponse(url=final or short_url)
+        try:
+            final = await bypass_provider(short_url)
+        except Exception as e:
+            logger.exception("bypass error for %s: %s", bridge_code, e)
+            final = None
+        return RedirectResponse(url=final or original_url)
 
-    return RedirectResponse(url=short_url)
+    return RedirectResponse(url=short_url or original_url)
